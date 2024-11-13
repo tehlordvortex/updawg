@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -20,11 +22,11 @@ func main() {
 	gs.Logger.Println("booting", *configPath)
 
 	config, errs := ParseConfig(*configPath)
-	for _, err := range errs {
-		gs.Logger.Println(err)
-	}
-
 	if config == nil {
+		for _, err := range errs {
+			gs.Logger.Println(err)
+		}
+
 		gs.Logger.Fatalln("failed to start because configuration file is not valid")
 	}
 
@@ -49,19 +51,22 @@ func stalk(target *Target, wg *sync.WaitGroup, gs *GlobalState) {
 	defer wg.Done()
 
 	logPrefix := fmt.Sprint("stalk(", target.Name, "@", target.Period, " seconds)")
+	tick := time.After(time.Duration(target.Period) * time.Second)
 
 	gs.Logger.Println(logPrefix, "running")
-
-	tick := time.After(time.Duration(target.Period) * time.Second)
+	defer func() {
+		gs.Logger.Println(logPrefix, "stopping")
+	}()
 
 	for {
 		select {
 		case <-gs.ctx.Done():
-			gs.Logger.Println(logPrefix, "stopping")
 			return
 		case <-tick:
 			req, err := http.NewRequestWithContext(gs.ctx, target.Method, target.Uri, nil)
-			if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			} else if err != nil {
 				gs.Logger.Println(logPrefix, target.Method, target.Uri)
 				gs.Logger.Println(logPrefix, "failed to construct req:", err)
 
@@ -70,6 +75,9 @@ func stalk(target *Target, wg *sync.WaitGroup, gs *GlobalState) {
 			}
 
 			resp, err := http.DefaultClient.Do(req)
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 
 			if err != nil {
 				gs.Logger.Println(logPrefix, target.Method, target.Uri)
