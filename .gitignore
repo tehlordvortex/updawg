@@ -1,2 +1,5 @@
-/stalker
-/stalker.toml
+/updawg
+/updawg.db
+/updawg.db-shm
+/updawg.db-wal
+/updawg.log
