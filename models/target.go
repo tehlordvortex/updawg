@@ -1,4 +1,4 @@
-package core
+package models
 
 import (
 	"database/sql"
@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/tehlordvortex/updawg/config"
-	"github.com/tehlordvortex/updawg/database"
 )
 
 const (
@@ -24,17 +23,6 @@ type Target struct {
 	config    map[string]interface{}
 	createdAt time.Time
 	updatedAt time.Time
-}
-
-func NewTarget(name, uri string, period int64) Target {
-	return Target{
-		pk:     -1,
-		id:     "",
-		Name:   name,
-		Uri:    uri,
-		Period: period,
-		Method: config.DefaultMethod,
-	}
 }
 
 func LoadTarget(row *sql.Row) (Target, error) {
@@ -73,16 +61,25 @@ func (t *Target) Pk() int64            { return t.pk }
 func (t *Target) Id() string           { return t.id }
 func (t *Target) CreatedAt() time.Time { return t.createdAt }
 func (t *Target) UpdatedAt() time.Time { return t.updatedAt }
+func (t *Target) DisplayName() string {
+	if t.Name == "" {
+		return t.Uri
+	} else {
+		return t.Name
+	}
+}
 
 // Target impl PassiveRecord
 
-func (t *Target) Load(Scan database.PassiveRecordScanFunc) error {
+func (t *Target) Load(Scan PassiveRecordScanFunc) error {
 	return loadTarget(t, Scan)
 }
 
-func (t *Target) Reload(QueryRow database.PassiveRecordQueryRowFunc) error {
+func (t *Target) Reload(QueryRow PassiveRecordQueryRowFunc) error {
 	if t.pk == -1 {
-		return database.ErrRecordNotPersisted
+		return ErrRecordDeleted
+	} else if t.pk == 0 && t.id == "" {
+		return ErrRecordNotPersisted
 	}
 
 	row := QueryRow("SELECT * FROM targets WHERE pk = ?", t.pk)
@@ -92,24 +89,38 @@ func (t *Target) Reload(QueryRow database.PassiveRecordQueryRowFunc) error {
 	})
 }
 
-func (t *Target) Save(Exec database.PassiveRecordExecFunc) error {
-	ts := time.Now().UTC()
-	unix := ts.Unix()
+func (t *Target) Save(Exec PassiveRecordExecFunc) error {
+	unix := time.Now().UTC().Unix()
 
-	if t.pk == -1 {
-		t.id = database.GenUlid("target")
+	if t.Uri == "" {
+		return fmt.Errorf("target must have a uri")
+	}
 
-		result, err := Exec("INSERT INTO targets (id, name, uri, period, created_at, updated_at, method) VALUES (?, ?, ?, ?, ?, ?, ?)", t.id, t.Name, t.Uri, t.Period, unix, unix, t.Method)
+	if t.Period == 0 {
+		t.Period = config.DefaultPeriod
+	} else if t.Period < 0 {
+		return fmt.Errorf("period cannot be negative")
+	}
+
+	if t.Method == "" {
+		t.Method = config.DefaultMethod
+	}
+
+	if t.pk == 0 && t.id == "" {
+		id := GenUlid("target")
+
+		result, err := Exec("INSERT INTO targets (id, name, uri, period, created_at, updated_at, method) VALUES (?, ?, ?, ?, ?, ?, ?)", id, t.Name, t.Uri, t.Period, unix, unix, t.Method)
 		if err != nil {
-			return fmt.Errorf("target.Save(%s): %v", t.id, err)
+			return fmt.Errorf("target.Save: %v", err)
 		}
 
 		pk, err := result.LastInsertId()
 		if err != nil {
-			return fmt.Errorf("target.Save(%s): %v", t.id, err)
+			return fmt.Errorf("target.Save: %v", err)
 		}
 
 		t.pk = pk
+		t.id = id
 		t.createdAt = time.Unix(unix, 0)
 		t.updatedAt = time.Unix(unix, 0)
 		return nil
@@ -124,7 +135,21 @@ func (t *Target) Save(Exec database.PassiveRecordExecFunc) error {
 	return nil
 }
 
-func loadTarget(t *Target, Scan database.PassiveRecordScanFunc) error {
+func (t *Target) Delete(Exec PassiveRecordExecFunc) error {
+	if t.pk == -1 {
+		return ErrRecordDeleted
+	}
+
+	_, err := Exec("DELETE FROM targets WHERE pk = ?", t.pk)
+	if err != nil {
+		return err
+	}
+
+	t.pk = -1
+	return nil
+}
+
+func loadTarget(t *Target, Scan PassiveRecordScanFunc) error {
 	var nameNullable, methodNullable sql.NullString
 	var configJson string
 	var createdAtUnix, updatedAtUnix int64

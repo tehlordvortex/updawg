@@ -1,4 +1,4 @@
-package database
+package models
 
 import (
 	"context"
@@ -13,12 +13,16 @@ type (
 	PassiveRecordQueryRowFunc func(query string, args ...any) *sql.Row
 )
 
-var ErrRecordNotPersisted = fmt.Errorf("record has not been saved to the database")
+var (
+	ErrRecordNotPersisted = fmt.Errorf("record has not been saved to the database")
+	ErrRecordDeleted      = fmt.Errorf("record has been deleted")
+)
 
 type PassiveRecord interface {
 	Load(Scan PassiveRecordScanFunc)
 	Reload(QueryRow PassiveRecordQueryRowFunc) error
 	Save(Exec PassiveRecordExecFunc) error
+	Delete(Exec PassiveRecordExecFunc) error
 }
 
 func ExecWithDatabase(ctx context.Context, db *sql.DB) PassiveRecordExecFunc {

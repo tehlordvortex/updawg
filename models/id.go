@@ -1,4 +1,4 @@
-package database
+package models
 
 import (
 	ulid "github.com/oklog/ulid/v2"

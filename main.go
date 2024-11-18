@@ -5,25 +5,24 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/tehlordvortex/updawg/cli"
 	_ "github.com/tehlordvortex/updawg/config"
-	_ "modernc.org/sqlite"
-
-	"github.com/tehlordvortex/updawg/database"
-	_ "github.com/tehlordvortex/updawg/database"
 )
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	db := database.Connect(ctx)
-	defer db.Close()
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt)
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt)
+		select {
+		case <-sigChan:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
-	// TODO: A lot
-
-	<-sigChan
-
-	cancel()
+	cli.Run(ctx)
 }

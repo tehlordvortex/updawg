@@ -9,11 +9,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-var logger *log.Logger
-
-func init() {
-	logger = log.New(config.GetLogFile(), "", log.Default().Flags()|log.Lmsgprefix|log.Lshortfile)
-}
+var logger = log.New(config.GetLogFile(), "", log.Default().Flags()|log.Lmsgprefix|log.Llongfile)
 
 func Connect(ctx context.Context) *sql.DB {
 	uri := config.GetDatabaseUri()
