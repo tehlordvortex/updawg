@@ -4,80 +4,91 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
-	"slices"
 	"time"
 
 	"github.com/tehlordvortex/updawg/config"
 	"github.com/tehlordvortex/updawg/models"
+	"github.com/tehlordvortex/updawg/pubsub"
 )
 
+type targetState struct {
+	cancel context.CancelFunc
+	target *models.Target
+}
+
 func runTargetsWorker(ctx context.Context, db *sql.DB) {
-	targets, err := models.LoadAllActiveTargets(models.QueryWithDatabase(ctx, db))
+	targetsPubSub, unsub, err := pubsub.SubscribeMany(ctx, []string{models.TargetCreatedTopic, models.TargetDeletedTopic})
+	if err != nil {
+		logger.Fatalln(err)
+	}
+	defer unsub()
+
+	targets, err := models.FindAllActiveTargets(ctx, db)
 	if err != nil {
 		logger.Fatalln(err)
 	}
 
-	cancelFuncs := make(map[string]context.CancelFunc)
+	states := make(map[string]targetState)
 	logger.Printf("starting monitoring for %d targets\n", len(targets))
 
 	for _, target := range targets {
 		targetCtx, cancel := context.WithCancel(ctx)
-		cancelFuncs[target.Id()] = cancel
+		state := targetState{cancel: cancel, target: &target}
+		states[target.Id()] = state
 
-		go runTargetWorker(targetCtx, db, &target)
+		go runTargetWorker(targetCtx, db, &state)
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-			newTargets, err := models.LoadAllActiveTargets(models.QueryWithDatabase(ctx, db))
-			if err != nil {
-				logger.Fatalln(err)
-			}
+		case message := <-targetsPubSub:
+			switch message.Topic {
+			case models.TargetCreatedTopic:
+				_, exists := states[message.Msg]
+				if exists {
+					continue
+				}
 
-			newTargetIds := make(map[string]bool)
-
-			for _, target := range newTargets {
-				newTargetIds[target.Id()] = true
-
-				_, existingTarget := cancelFuncs[target.Id()]
-				if existingTarget {
+				target, err := models.FindTargetById(ctx, db, message.Msg)
+				if err != nil {
+					logger.Printf("failed to load target %s: %v\n", message.Msg, err)
 					continue
 				}
 
 				targetCtx, cancel := context.WithCancel(ctx)
-				cancelFuncs[target.Id()] = cancel
+				state := targetState{cancel: cancel, target: &target}
+				states[target.Id()] = state
 
-				logger.Printf("starting monitoring for new target name=%s\n", target.DisplayName())
-				go runTargetWorker(targetCtx, db, &target)
-			}
-
-			for targetId, cancelFunc := range cancelFuncs {
-				stillExists := newTargetIds[targetId]
-				if !stillExists {
-					targetIdx := slices.IndexFunc(targets, func(t models.Target) bool {
-						return t.Id() == targetId
-					})
-					target := targets[targetIdx]
-
-					logger.Printf("stopping monitoring for deleted target %s\n", target.DisplayName())
-					cancelFunc()
-					delete(cancelFuncs, targetId)
+				logger.Printf("starting monitoring for new target id=%s name=%s\n", target.Id(), target.DisplayName())
+				go runTargetWorker(targetCtx, db, &state)
+			case models.TargetDeletedTopic:
+				state, exists := states[message.Msg]
+				if !exists {
+					continue
 				}
-			}
 
-			targets = newTargets
-			time.Sleep(time.Second)
+				logger.Printf("stopping monitoring for deleted target id=%s\n", message.Msg)
+				state.cancel()
+				delete(states, message.Msg)
+			}
 		}
 	}
 }
 
-func runTargetWorker(ctx context.Context, db *sql.DB, target *models.Target) {
+func runTargetWorker(ctx context.Context, db *sql.DB, state *targetState) {
+	defer state.cancel()
+
+	targetPubSub, unsub, err := pubsub.Subscribe(ctx, models.TargetUpdatedTopic)
+	if err != nil {
+		logger.Fatalln("pubsub.Sub failed:", err)
+	}
+	defer unsub()
+
 	var timer <-chan time.Time
 	next := func() {
-		timer = time.After(time.Duration(target.Period) * time.Second)
+		timer = time.After(time.Duration(state.target.Period) * time.Second)
 	}
 	next()
 
@@ -85,13 +96,26 @@ func runTargetWorker(ctx context.Context, db *sql.DB, target *models.Target) {
 		select {
 		case <-ctx.Done():
 			return
+		case message := <-targetPubSub:
+			if message.Msg != state.target.Id() {
+				continue
+			}
+
+			if err := state.target.Reload(ctx, db); err != nil {
+				if err == sql.ErrNoRows {
+					return
+				}
+
+				logger.Printf("failed to reload target: %v id=%", err, state.target.Id())
+				return
+			}
 		case <-timer:
-			req, err := http.NewRequestWithContext(ctx, target.Method, target.Uri, nil)
+			req, err := http.NewRequestWithContext(ctx, state.target.Method, state.target.Uri, nil)
 			if err != nil {
 				if err == context.Canceled {
 					return
 				}
-				logger.Printf("%s: failed: %v\n", target.DisplayName(), err)
+				logger.Printf("health check failed id=%s name=%s error=%v\n", state.target.Id(), state.target.DisplayName(), err)
 
 				next()
 				continue
@@ -102,14 +126,14 @@ func runTargetWorker(ctx context.Context, db *sql.DB, target *models.Target) {
 				if err == context.Canceled {
 					return
 				}
-				logger.Printf("%s: unhealthy: %v\n", target.DisplayName(), err)
+				logger.Printf("health check failed id=%s name=%s error=%v\n", state.target.Id(), state.target.DisplayName(), err)
 
 				next()
 				continue
 			}
 
 			if res.StatusCode != config.DefaultResponseCode {
-				logger.Printf("%s: unhealthy status=%d\n", res.StatusCode)
+				logger.Printf("health check failed id=%s name=%s status=%d\n", state.target.Id(), state.target.DisplayName(), res.StatusCode)
 
 				next()
 				continue

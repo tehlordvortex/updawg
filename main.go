@@ -7,11 +7,16 @@ import (
 
 	"github.com/tehlordvortex/updawg/cli"
 	_ "github.com/tehlordvortex/updawg/config"
+	"github.com/tehlordvortex/updawg/database"
+	"github.com/tehlordvortex/updawg/pubsub"
 )
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	db := database.Connect(ctx)
+	pubsub.Run(ctx)
 
 	go func() {
 		sigChan := make(chan os.Signal, 1)
@@ -24,5 +29,5 @@ func main() {
 		}
 	}()
 
-	cli.Run(ctx)
+	cli.Run(ctx, db)
 }

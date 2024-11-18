@@ -2,16 +2,16 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
 	"os"
 
 	"github.com/tehlordvortex/updawg/config"
-	"github.com/tehlordvortex/updawg/database"
 	"github.com/tehlordvortex/updawg/models"
 )
 
-func runTargetsCommand(ctx context.Context, args []string) {
+func runTargetsCommand(ctx context.Context, db *sql.DB, args []string) {
 	fs := flag.NewFlagSet("targets", flag.ExitOnError)
 	if err := fs.Parse(args); err != nil {
 		logger.Fatalln(err)
@@ -29,11 +29,13 @@ func runTargetsCommand(ctx context.Context, args []string) {
 
 	switch command {
 	case "create":
-		runCreateCommand(ctx, subArgs)
+		runCreateCommand(ctx, db, subArgs)
+	case "modify":
+		runModifyCommand(ctx, db, subArgs)
 	case "list":
-		runListCommand(ctx, subArgs)
+		runListCommand(ctx, db, subArgs)
 	case "delete":
-		runDeleteCommand(ctx, subArgs)
+		runDeleteCommand(ctx, db, subArgs)
 	default:
 		logger.Println("unknown command:", command)
 		printTargetsUsage(fs)
@@ -45,13 +47,14 @@ func printTargetsUsage(fs *flag.FlagSet) {
 	fmt.Fprintf(flag.CommandLine.Output(), Header)
 	fmt.Fprintln(flag.CommandLine.Output(), "targets - Manage monitoring targets")
 	fmt.Fprintln(flag.CommandLine.Output(), "create\t\tCreate new target")
+	fmt.Fprintln(flag.CommandLine.Output(), "modify\t\tModify a target")
 	fmt.Fprintln(flag.CommandLine.Output(), "list\t\tList existing targets")
 	fmt.Fprintln(flag.CommandLine.Output(), "delete\t\tDelete a target")
 	fs.PrintDefaults()
 	flag.PrintDefaults()
 }
 
-func runCreateCommand(ctx context.Context, args []string) {
+func runCreateCommand(ctx context.Context, db *sql.DB, args []string) {
 	fs := flag.NewFlagSet("targets create", flag.ExitOnError)
 	name := fs.String("name", "", "An optional name for the target")
 	uri := fs.String("uri", "", "The URI to make requests to")
@@ -67,8 +70,6 @@ func runCreateCommand(ctx context.Context, args []string) {
 		os.Exit(1)
 	}
 
-	db := database.Connect(ctx)
-
 	target := models.Target{
 		Name:   *name,
 		Uri:    *uri,
@@ -76,65 +77,99 @@ func runCreateCommand(ctx context.Context, args []string) {
 		Period: int64(*period),
 	}
 
-	if err := target.Save(models.ExecWithDatabase(ctx, db)); err != nil {
+	if err := target.Save(ctx, db); err != nil {
 		logger.Fatalln(err)
 	}
 
 	logger.Println("target created id=" + target.Id())
 }
 
-func runListCommand(ctx context.Context, args []string) {
-	db := database.Connect(ctx)
+func runModifyCommand(ctx context.Context, db *sql.DB, args []string) {
+	fs := flag.NewFlagSet("targets modify", flag.ExitOnError)
+	id := fs.String("id", "", "The ID of the target to modify (can be partial)")
+	name := fs.String("name", "", "An optional name for the target")
+	uri := fs.String("uri", "", "The URI to make requests to")
+	method := fs.String("method", config.DefaultMethod, "The HTTP method to use")
+	period := fs.Uint("period", config.DefaultPeriod, "The interval (in seconds) in which requests are made")
 
-	rows, err := db.QueryContext(ctx, "SELECT * FROM targets")
+	if err := fs.Parse(args); err != nil {
+		logger.Fatalln(err)
+	}
+
+	if *id == "" {
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	targets, err := models.FindTargetsByIdPrefix(ctx, db, *id)
 	if err != nil {
 		logger.Fatalln(err)
 	}
 
-	for rows.Next() {
-		var target models.Target
-		if err := target.Load(func(cols []interface{}) error {
-			return rows.Scan(cols...)
-		}); err != nil {
-			logger.Fatalln(err)
-		}
+	if len(targets) == 0 {
+		logger.Fatalln("not found:", id)
+	} else if len(targets) != 1 {
+		logger.Fatalln(id, "is ambiguous")
+	}
 
-		fmt.Println(target)
+	target := targets[0]
+
+	if *name != "" {
+		target.Name = *name
+	}
+
+	if *uri != "" {
+		target.Uri = *uri
+	}
+
+	if *method != "" {
+		target.Method = *method
+	}
+
+	if *period != 0 {
+		target.Period = int64(*period)
+	}
+
+	if err := target.Save(ctx, db); err != nil {
+		logger.Fatalln(err)
+	}
+
+	logger.Println("target updated:", target)
+}
+
+func runListCommand(ctx context.Context, db *sql.DB, args []string) {
+	targets, err := models.FindAllTargets(ctx, db)
+	if err != nil {
+		logger.Fatalln(err)
+	}
+
+	for _, target := range targets {
+		logger.Println(target)
 	}
 }
 
-func runDeleteCommand(ctx context.Context, args []string) {
-	db := database.Connect(ctx)
-
+func runDeleteCommand(ctx context.Context, db *sql.DB, args []string) {
 	if len(args) == 0 {
 		logger.Fatalln("missing target id")
 	}
 
 	id := args[0]
-	rows, err := db.QueryContext(ctx, "SELECT * FROM targets WHERE id LIKE ?", id+"%")
+
+	targets, err := models.FindTargetsByIdPrefix(ctx, db, id)
 	if err != nil {
 		logger.Fatalln(err)
 	}
 
-	var target models.Target
-	if !rows.Next() {
+	if len(targets) == 0 {
 		logger.Fatalln("not found:", id)
-	}
-
-	err = target.Load(func(cols []interface{}) error {
-		return rows.Scan(cols...)
-	})
-	if err != nil {
-		logger.Fatalln(err)
-	}
-
-	if rows.Next() {
+	} else if len(targets) != 1 {
 		logger.Fatalln(id, "is ambiguous")
 	}
 
-	if err := target.Delete(models.ExecWithDatabase(ctx, db)); err != nil {
+	target := targets[0]
+	if err := target.Delete(ctx, db); err != nil {
 		logger.Fatalln(err)
 	}
 
-	fmt.Println("deleted:", target)
+	logger.Println("deleted:", target)
 }

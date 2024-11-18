@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
 	"log"
@@ -16,7 +17,7 @@ const (
 
 var logger = log.New(config.GetLogFile(), "", log.Default().Flags()|log.Lmsgprefix|log.Llongfile)
 
-func Run(ctx context.Context) {
+func Run(ctx context.Context, db *sql.DB) {
 	flag.Parse()
 
 	args := flag.Args()
@@ -31,9 +32,9 @@ func Run(ctx context.Context) {
 
 	switch command {
 	case "targets":
-		runTargetsCommand(ctx, subArgs)
+		runTargetsCommand(ctx, db, subArgs)
 	case "serve":
-		runServeCommand(ctx, subArgs)
+		runServeCommand(ctx, db, subArgs)
 	default:
 		logger.Println("unknown command:", command)
 		printUsage()

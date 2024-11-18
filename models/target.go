@@ -1,16 +1,21 @@
 package models
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/tehlordvortex/updawg/config"
+	"github.com/tehlordvortex/updawg/pubsub"
 )
 
 const (
-	TargetTableName = "targets"
+	TargetModelTableName = "targets"
+	TargetCreatedTopic   = "target.created"
+	TargetDeletedTopic   = "target.deleted"
+	TargetUpdatedTopic   = "target.updated"
 )
 
 type Target struct {
@@ -43,21 +48,21 @@ func (t *Target) Load(Scan PassiveRecordScanFunc) error {
 	return loadTarget(t, Scan)
 }
 
-func (t *Target) Reload(QueryRow PassiveRecordQueryRowFunc) error {
+func (t *Target) Reload(ctx context.Context, qe QueryExecutor) error {
 	if t.pk == -1 {
 		return ErrRecordDeleted
 	} else if t.pk == 0 && t.id == "" {
 		return ErrRecordNotPersisted
 	}
 
-	row := QueryRow("SELECT * FROM targets WHERE pk = ?", t.pk)
+	row := qe.QueryRowContext(ctx, "SELECT * FROM targets WHERE pk = ?", t.pk)
 
 	return t.Load(func(cols []interface{}) error {
 		return row.Scan(cols...)
 	})
 }
 
-func (t *Target) Save(Exec PassiveRecordExecFunc) error {
+func (t *Target) Save(ctx context.Context, qe QueryExecutor) error {
 	unix := time.Now().UTC().Unix()
 
 	if t.Uri == "" {
@@ -77,7 +82,7 @@ func (t *Target) Save(Exec PassiveRecordExecFunc) error {
 	if t.pk == 0 && t.id == "" {
 		id := GenUlid("target")
 
-		result, err := Exec("INSERT INTO targets (id, name, uri, period, created_at, updated_at, method) VALUES (?, ?, ?, ?, ?, ?, ?)", id, t.Name, t.Uri, t.Period, unix, unix, t.Method)
+		result, err := qe.ExecContext(ctx, "INSERT INTO targets (id, name, uri, period, created_at, updated_at, method) VALUES (?, ?, ?, ?, ?, ?, ?)", id, t.Name, t.Uri, t.Period, unix, unix, t.Method)
 		if err != nil {
 			return fmt.Errorf("target.Save: %v", err)
 		}
@@ -91,39 +96,73 @@ func (t *Target) Save(Exec PassiveRecordExecFunc) error {
 		t.id = id
 		t.createdAt = time.Unix(unix, 0)
 		t.updatedAt = time.Unix(unix, 0)
+
+		_ = pubsub.Publish(ctx, TargetCreatedTopic, t.id)
 		return nil
 	}
 
-	_, err := Exec("UPDATE targets SET (name, uri, period, updated_at, method) = (?, ?, ?, ?, ?) WHERE pk = ?", t.Name, t.Uri, t.Period, unix, t.Method, t.pk)
+	_, err := qe.ExecContext(ctx, "UPDATE targets SET (name, uri, period, updated_at, method) = (?, ?, ?, ?, ?) WHERE pk = ?", t.Name, t.Uri, t.Period, unix, t.Method, t.pk)
 	if err != nil {
 		return fmt.Errorf("target.Save(%s): %v", t.id, err)
 	}
 
 	t.updatedAt = time.Unix(unix, 0)
+
+	_ = pubsub.Publish(ctx, TargetUpdatedTopic, t.id)
 	return nil
 }
 
-func (t *Target) Delete(Exec PassiveRecordExecFunc) error {
+func (t *Target) Delete(ctx context.Context, qe QueryExecutor) error {
 	if t.pk == -1 {
 		return ErrRecordDeleted
 	}
 
-	_, err := Exec("DELETE FROM targets WHERE pk = ?", t.pk)
+	_, err := qe.ExecContext(ctx, "DELETE FROM targets WHERE pk = ?", t.pk)
 	if err != nil {
 		return err
 	}
 
 	t.pk = -1
+
+	_ = pubsub.Publish(ctx, TargetDeletedTopic, t.id)
 	return nil
+}
+
+func FindAllTargets(ctx context.Context, qe QueryExecutor) ([]Target, error) {
+	rows, err := qe.QueryContext(ctx, "SELECT * FROM targets")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return LoadTargets(rows)
+}
+
+func FindAllActiveTargets(ctx context.Context, qe QueryExecutor) ([]Target, error) {
+	// TODO: Disable/enable targets
+	return FindAllTargets(ctx, qe)
+}
+
+func FindTargetById(ctx context.Context, qe QueryExecutor, id string) (Target, error) {
+	return LoadTarget(qe.QueryRowContext(ctx, "SELECT * FROM targets WHERE id = ?", id))
+}
+
+func FindTargetsByIdPrefix(ctx context.Context, qe QueryExecutor, prefix string) ([]Target, error) {
+	rows, err := qe.QueryContext(ctx, "SELECT * FROM targets WHERE id LIKE ?", prefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return LoadTargets(rows)
 }
 
 func LoadTarget(row *sql.Row) (Target, error) {
 	var t Target
 
-	err := t.Load(func(cols []interface{}) error {
+	if err := t.Load(func(cols []interface{}) error {
 		return row.Scan(cols...)
-	})
-	if err != nil {
+	}); err != nil {
 		return Target{}, fmt.Errorf("LoadTarget: %v", err)
 	}
 
@@ -179,17 +218,4 @@ func loadTarget(t *Target, Scan PassiveRecordScanFunc) error {
 	t.updatedAt = time.Unix(updatedAtUnix, 0)
 
 	return nil
-}
-
-func QueryAllActiveTargets(Query PassiveRecordQueryFunc) (*sql.Rows, error) {
-	return Query("SELECT * FROM targets")
-}
-
-func LoadAllActiveTargets(Query PassiveRecordQueryFunc) ([]Target, error) {
-	rows, err := QueryAllActiveTargets(Query)
-	if err != nil {
-		return nil, err
-	}
-
-	return LoadTargets(rows)
 }

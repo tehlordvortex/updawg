@@ -1,5 +1,5 @@
-/updawg
-/updawg.db
-/updawg.db-shm
-/updawg.db-wal
+/updawg*
+/updawg*.db
+/updawg*.db-shm
+/updawg*.db-wal
 /updawg.log

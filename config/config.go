@@ -13,7 +13,10 @@ const (
 	DefaultMethod       = http.MethodHead
 )
 
-const DefaultDatabasePath = "updawg.db"
+const (
+	DefaultDatabasePath       = "updawg.db"
+	DefaultPubsubDatabasePath = "updawg_pubsub.db"
+)
 
 var logFile *os.File
 
@@ -35,6 +38,15 @@ func GetDatabaseUri() string {
 	path := os.Getenv("UPDAWG_DB")
 	if path == "" {
 		path = filepath.Join(os.Getenv("PWD"), DefaultDatabasePath)
+	}
+
+	return "file://" + path + "?_pragma=journal_mode(WAL)"
+}
+
+func GetPubsubDatabaseUri() string {
+	path := os.Getenv("UPDAWG_PUBSUB_DB")
+	if path == "" {
+		path = filepath.Join(os.Getenv("PWD"), DefaultPubsubDatabasePath)
 	}
 
 	return "file://" + path + "?_pragma=journal_mode(WAL)"
