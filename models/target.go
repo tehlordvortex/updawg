@@ -25,38 +25,6 @@ type Target struct {
 	updatedAt time.Time
 }
 
-func LoadTarget(row *sql.Row) (Target, error) {
-	var t Target
-
-	err := t.Load(func(cols []interface{}) error {
-		return row.Scan(cols...)
-	})
-	if err != nil {
-		return Target{}, fmt.Errorf("LoadTarget: %v", err)
-	}
-
-	return t, nil
-}
-
-func LoadTargets(rows *sql.Rows) ([]Target, error) {
-	var targets []Target
-
-	for rows.Next() {
-		var t Target
-
-		err := t.Load(func(cols []interface{}) error {
-			return rows.Scan(cols...)
-		})
-		if err != nil {
-			return nil, fmt.Errorf("LoadTargets: %v", err)
-		}
-
-		targets = append(targets, t)
-	}
-
-	return targets, nil
-}
-
 func (t *Target) Pk() int64            { return t.pk }
 func (t *Target) Id() string           { return t.id }
 func (t *Target) CreatedAt() time.Time { return t.createdAt }
@@ -149,6 +117,38 @@ func (t *Target) Delete(Exec PassiveRecordExecFunc) error {
 	return nil
 }
 
+func LoadTarget(row *sql.Row) (Target, error) {
+	var t Target
+
+	err := t.Load(func(cols []interface{}) error {
+		return row.Scan(cols...)
+	})
+	if err != nil {
+		return Target{}, fmt.Errorf("LoadTarget: %v", err)
+	}
+
+	return t, nil
+}
+
+func LoadTargets(rows *sql.Rows) ([]Target, error) {
+	var targets []Target
+
+	for rows.Next() {
+		var t Target
+
+		err := t.Load(func(cols []interface{}) error {
+			return rows.Scan(cols...)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("LoadTargets: %v", err)
+		}
+
+		targets = append(targets, t)
+	}
+
+	return targets, nil
+}
+
 func loadTarget(t *Target, Scan PassiveRecordScanFunc) error {
 	var nameNullable, methodNullable sql.NullString
 	var configJson string
@@ -179,4 +179,17 @@ func loadTarget(t *Target, Scan PassiveRecordScanFunc) error {
 	t.updatedAt = time.Unix(updatedAtUnix, 0)
 
 	return nil
+}
+
+func QueryAllActiveTargets(Query PassiveRecordQueryFunc) (*sql.Rows, error) {
+	return Query("SELECT * FROM targets")
+}
+
+func LoadAllActiveTargets(Query PassiveRecordQueryFunc) ([]Target, error) {
+	rows, err := QueryAllActiveTargets(Query)
+	if err != nil {
+		return nil, err
+	}
+
+	return LoadTargets(rows)
 }
