@@ -4,7 +4,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 )
 
 const (
@@ -14,8 +13,7 @@ const (
 )
 
 const (
-	DefaultDatabasePath       = "updawg.db"
-	DefaultPubsubDatabasePath = "updawg_pubsub.db"
+	DefaultDatabasePath = "updawg.db"
 )
 
 var logFile *os.File
@@ -34,22 +32,22 @@ func init() {
 	}
 }
 
-func GetDatabaseUri() string {
+func GetDatabasePath() string {
 	path := os.Getenv("UPDAWG_DB")
 	if path == "" {
-		path = filepath.Join(os.Getenv("PWD"), DefaultDatabasePath)
+		return DefaultDatabasePath
 	}
 
-	return "file://" + path + "?_pragma=journal_mode(WAL)"
+	return path
 }
 
-func GetPubsubDatabaseUri() string {
+func GetPubsubDatabasePath() string {
 	path := os.Getenv("UPDAWG_PUBSUB_DB")
 	if path == "" {
-		path = filepath.Join(os.Getenv("PWD"), DefaultPubsubDatabasePath)
+		return GetDatabasePath()
 	}
 
-	return "file://" + path + "?_pragma=journal_mode(WAL)"
+	return path
 }
 
 func GetLogFile() *os.File {

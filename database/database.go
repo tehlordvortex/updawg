@@ -3,68 +3,65 @@ package database
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/tehlordvortex/updawg/config"
-	_ "modernc.org/sqlite"
 )
 
 var logger = log.New(config.GetLogFile(), "", log.Default().Flags()|log.Lmsgprefix|log.Lshortfile)
 
-func Connect(ctx context.Context) *sql.DB {
-	uri := config.GetDatabaseUri()
-
-	db, err := sql.Open("sqlite", uri)
-	if err != nil {
-		logger.Fatalf("sql.Open(%s): %v", uri, err)
-	}
-
-	err = db.PingContext(ctx)
-	if err != nil {
-		logger.Fatalf("db.PingContext(%s): %v", uri, err)
-	}
-
-	logger.Printf("connected db=%s", uri)
-	setupDatabase(ctx, db)
-
-	return db
+type RWDB struct {
+	r *sql.DB
+	w *sql.DB
 }
 
-func setupDatabase(ctx context.Context, db *sql.DB) {
-	_, err := db.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS migrations (
-  id integer NOT NULL PRIMARY KEY
-)`)
-	if err != nil {
-		logger.Fatalf("setupDatabase: %v", err)
-	}
+func (r *RWDB) Read() *sql.DB  { return r.r }
+func (r *RWDB) Write() *sql.DB { return r.w }
 
-	firstRun, lastMigrationId, err := getLastMigrationId(ctx, db)
-	if err != nil {
-		logger.Fatalf("setupDatabase: %v", err)
-	}
+func Connect(ctx context.Context, path string) (*RWDB, error) {
+	connect := func(writeable bool) (*sql.DB, error) {
+		var uri string
 
-	files, err := migrations.ReadDir("migrations")
-	if err != nil {
-		logger.Fatalf("setupDatabase: %v", err)
-	}
-
-	for _, file := range files {
-		if file.IsDir() {
-			continue
+		if writeable {
+			uri = fmt.Sprintf("file:%s?mode=rwc&_journal_mode=wal&_txlock=immediate&_busy_timeout=5000", path)
+		} else {
+			uri = fmt.Sprintf("file:%s?mode=ro&_journal_mode=wal&_txlock=deferred", path)
 		}
 
-		name := file.Name()
-		id, migration, query, err := getMigration(name)
+		db, err := sql.Open("sqlite3", uri)
 		if err != nil {
-			logger.Fatalf("setupDatabase: invalid migration %s: %v", name, err)
+			return nil, fmt.Errorf("sql.Open(%s): %v", uri, err)
 		}
 
-		if id > lastMigrationId || firstRun {
-			migrate(ctx, db, id, migration, query)
-
-			lastMigrationId = id
-			firstRun = false
+		if writeable {
+			db.SetMaxOpenConns(1)
+			db.SetMaxIdleConns(1)
+			db.SetConnMaxLifetime(0)
+			db.SetConnMaxIdleTime(0)
 		}
+
+		err = db.PingContext(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("db.PingContext(%s): %v", uri, err)
+		}
+
+		logger.Printf("connected path=%s writeable=%t", path, writeable)
+
+		return db, nil
 	}
+
+	// Connect to database in R/W mode first to ensure it gets created
+	w, err := connect(true)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := connect(false)
+	if err != nil {
+		return nil, err
+	}
+
+	return &RWDB{r, w}, nil
 }

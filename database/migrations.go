@@ -12,6 +12,45 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
+func RunMigrations(ctx context.Context, db *sql.DB) {
+	_, err := db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS migrations (
+  id integer NOT NULL PRIMARY KEY
+)`)
+	if err != nil {
+		logger.Fatalf("setupDatabase: %v", err)
+	}
+
+	firstRun, lastMigrationId, err := getLastMigrationId(ctx, db)
+	if err != nil {
+		logger.Fatalf("setupDatabase: %v", err)
+	}
+
+	files, err := migrations.ReadDir("migrations")
+	if err != nil {
+		logger.Fatalf("setupDatabase: %v", err)
+	}
+
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		name := file.Name()
+		id, migration, query, err := getMigration(name)
+		if err != nil {
+			logger.Fatalf("setupDatabase: invalid migration %s: %v", name, err)
+		}
+
+		if id > lastMigrationId || firstRun {
+			migrate(ctx, db, id, migration, query)
+
+			lastMigrationId = id
+			firstRun = false
+		}
+	}
+}
+
 func migrate(ctx context.Context, db *sql.DB, id int64, migration, query string) {
 	fail := func(err error) {
 	}

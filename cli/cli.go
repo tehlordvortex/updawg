@@ -2,13 +2,14 @@ package cli
 
 import (
 	"context"
-	"database/sql"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 
 	"github.com/tehlordvortex/updawg/config"
+	"github.com/tehlordvortex/updawg/database"
+	"github.com/tehlordvortex/updawg/pubsub"
 )
 
 const (
@@ -17,7 +18,7 @@ const (
 
 var logger = log.New(config.GetLogFile(), "", log.Default().Flags()|log.Lmsgprefix|log.Llongfile)
 
-func Run(ctx context.Context, db *sql.DB) {
+func Run(ctx context.Context, rwdb *database.RWDB, ps *pubsub.PubSub) {
 	flag.Parse()
 
 	args := flag.Args()
@@ -32,9 +33,9 @@ func Run(ctx context.Context, db *sql.DB) {
 
 	switch command {
 	case "targets":
-		runTargetsCommand(ctx, db, subArgs)
+		runTargetsCommand(ctx, rwdb, ps, subArgs)
 	case "serve":
-		runServeCommand(ctx, db, subArgs)
+		runServeCommand(ctx, rwdb, ps, subArgs)
 	default:
 		logger.Println("unknown command:", command)
 		printUsage()

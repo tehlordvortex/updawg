@@ -10,22 +10,24 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
-
 	"github.com/tehlordvortex/updawg/config"
+	"github.com/tehlordvortex/updawg/database"
 )
 
 var ErrNotRunning = fmt.Errorf("pubsub is not running")
 
 const CreatePubsubTableSql = (`
 CREATE TABLE IF NOT EXISTS pubsub (
+	id integer NOT NULL PRIMARY KEY,
 	topic varchar(255) NOT NULL,
 	message text NOT NULL,
 	timestamp integer NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS pubsub_on_topic_and_timestamp ON pubsub (topic, timestamp);
-CREATE INDEX IF NOT EXISTS pubsub_on_timestamp ON pubsub (timestamp);
+-- CREATE INDEX IF NOT EXISTS pubsub_topic ON pubsub (topic);
+-- CREATE INDEX IF NOT EXISTS pubsub_timestamp ON pubsub (timestamp);
+-- CREATE INDEX IF NOT EXISTS pubsub_topic_timestamp ON pubsub (topic, timestamp);
+-- CREATE INDEX IF NOT EXISTS pubsub_id_topic_timestamp ON pubsub (id, topic, timestamp);
 	`)
 
 type Message struct {
@@ -34,177 +36,328 @@ type Message struct {
 	Ts    time.Time
 }
 
-var (
-	db        *sql.DB
-	mut       = &sync.Mutex{}
-	topicSubs = make(map[string][]chan Message)
-	logger    = log.New(config.GetLogFile(), "", log.Default().Flags()|log.Lmsgprefix|log.Lshortfile)
-)
-
-func Run(ctx context.Context) {
-	var err error
-
-	_db, err := sql.Open("sqlite", config.GetPubsubDatabaseUri())
-	if err != nil {
-		logger.Fatalln("failed to start pubsub:", err)
-	}
-
-	_, err = _db.ExecContext(ctx, CreatePubsubTableSql)
-	if err != nil {
-		logger.Fatalln("failed to start pubsub:", err)
-	}
-
-	var lastTsUnix int64
-	err = _db.QueryRowContext(ctx, "SELECT timestamp FROM pubsub ORDER BY timestamp DESC LIMIT 1").Scan(&lastTsUnix)
-	if err != nil {
-		if err != sql.ErrNoRows {
-			logger.Fatalln("failed to start pubsub:", err)
-		}
-	}
-
-	db = _db
-	logger.Printf("pubsub streaming messages after ts=%d", lastTsUnix)
-
-	go func() {
-		getTopics := func() []string {
-			mut.Lock()
-			defer mut.Unlock()
-
-			var topics []string
-			for topic := range topicSubs {
-				topics = append(topics, topic)
-			}
-
-			return topics
-		}
-
-		notify := func(msg Message) {
-			mut.Lock()
-			defer mut.Unlock()
-
-			subs := topicSubs[msg.Topic]
-			for _, ch := range subs {
-				ch <- msg
-			}
-		}
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				messages, lastTs, err := loadMessagesForTopics(ctx, getTopics(), lastTsUnix)
-				if err != nil {
-					logger.Println(err)
-					return
-				}
-
-				for _, message := range messages {
-					logger.Printf("pubsub.Recv(%s): %s ts=%d", message.Topic, message.Msg, message.Ts.UnixMilli())
-					notify(message)
-				}
-
-				if lastTs != 0 {
-					lastTsUnix = lastTs
-				}
-				time.Sleep(time.Millisecond)
-			}
-		}
-	}()
+type PublishMessage struct {
+	ts       time.Time
+	data     [][]string
+	respChan chan error
 }
 
-func Publish(ctx context.Context, topic string, message string) error {
-	if db == nil {
-		logger.Printf("pubsub.Publish(%s): failed: %v", topic, ErrNotRunning)
-		return ErrNotRunning
+type subscription struct {
+	topics []string
+	ch     chan *Message
+}
+
+type PubSub struct {
+	rwdb      *database.RWDB
+	mut       sync.Mutex
+	topicSubs map[string][]subscription
+	batchChan chan []any
+	batchCtx  context.Context
+}
+
+const (
+	Interval  = time.Millisecond * 1
+	MaxVarNum = 32766
+	ChunkSize = MaxVarNum / 3
+)
+
+var MaxQueueLen = ChunkSize
+
+var logger = log.New(config.GetLogFile(), "", log.Default().Flags()|log.Lmsgprefix|log.Lshortfile)
+
+func Connect(ctx context.Context, path string) (*PubSub, error) {
+	fail := func(err error) error {
+		return fmt.Errorf("pubsub.Connect(%s): %v", path, err)
 	}
 
-	tx, err := db.BeginTx(ctx, nil)
+	var err error
+	ps := &PubSub{mut: sync.Mutex{}, topicSubs: make(map[string][]subscription), batchChan: make(chan []any, MaxQueueLen)}
+
+	ps.rwdb, err = database.Connect(context.Background(), path)
 	if err != nil {
-		logger.Printf("pubsub.Publish(%s): failed: %v", topic, err)
-		return err
+		return nil, fail(err)
 	}
-	defer tx.Rollback()
 
+	_, err = ps.rwdb.Write().ExecContext(ctx, CreatePubsubTableSql)
+	if err != nil {
+		return nil, fail(err)
+	}
+
+	var lastId int64
+	err = ps.rwdb.Write().QueryRowContext(ctx, "SELECT id FROM pubsub ORDER BY id DESC LIMIT 1").Scan(&lastId)
+	if err != nil {
+		if err != sql.ErrNoRows {
+			return nil, fail(err)
+		}
+	}
+	logger.Printf("connnected after=%d", lastId)
+
+	go ps.runListener(ctx, lastId)
+
+	batchCtx, cancel := context.WithCancel(context.Background())
+	ps.batchCtx = batchCtx
+	go ps.runBatcher(ctx, batchCtx, cancel)
+
+	return ps, nil
+}
+
+func (ps *PubSub) Publish(ctx context.Context, topic string, message string) error {
+	return ps.PublishMany(ctx, [][]string{{topic, message}})
+}
+
+func (ps *PubSub) PublishAsync(topic, message string) {
+	ps.batchChan <- []any{topic, message, time.Now().UnixMicro()}
+}
+
+func (ps *PubSub) PublishMany(ctx context.Context, topicsAndMessages [][]string) error {
 	now := time.Now()
-	logger.Printf("pubsub.Publish(%s): %s ts=%d", topic, message, now.UnixMilli())
-	_, err = tx.ExecContext(ctx, "INSERT INTO pubsub (topic, message, timestamp) VALUES (?, ?, ?)", topic, message, now.UnixMilli())
-	if err != nil {
-		logger.Printf("pubsub.Publish(%s): failed: %v", topic, err)
-		return err
-	}
 
-	if err := tx.Commit(); err != nil {
-		logger.Printf("pubsub.Publish(%s): failed: %v", topic, err)
-		return err
+	for topicsAndMessages := range slices.Chunk(topicsAndMessages, ChunkSize) {
+		var msgs [][]any
+
+		for _, topicAndMessage := range topicsAndMessages {
+			msgs = append(msgs, []any{topicAndMessage[0], topicAndMessage[1], now})
+		}
+
+		if err := ps.publishMessages(ctx, msgs); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func Subscribe(ctx context.Context, topic string) (<-chan Message, context.CancelFunc, error) {
-	return SubscribeMany(ctx, []string{topic})
+func (ps *PubSub) PublishManyToTopic(ctx context.Context, topic string, messages []string) error {
+	topicsAndMessages := make([][]string, 0, len(messages))
+	for _, message := range messages {
+		topicsAndMessages = append(topicsAndMessages, []string{topic, message})
+	}
+
+	return ps.PublishMany(ctx, topicsAndMessages)
 }
 
-func SubscribeMany(ctx context.Context, topics []string) (<-chan Message, context.CancelFunc, error) {
-	if db == nil {
+func (ps *PubSub) Subscribe(ctx context.Context, topic string, buffer int) (<-chan *Message, context.CancelFunc, error) {
+	return ps.SubscribeMany(ctx, []string{topic}, buffer)
+}
+
+func (ps *PubSub) SubscribeMany(ctx context.Context, topics []string, buffer int) (<-chan *Message, context.CancelFunc, error) {
+	if ps.rwdb == nil {
 		return nil, nil, ErrNotRunning
 	}
 
-	ch := make(chan Message)
-	unsub := func() {
-		mut.Lock()
-		defer mut.Unlock()
+	ch := make(chan *Message, buffer)
+	sub := subscription{topics, ch}
 
-		for _, topic := range topics {
-			subs := topicSubs[topic]
-			subs = slices.DeleteFunc(subs, func(c chan Message) bool {
-				return c == ch
+	ps.mut.Lock()
+	defer ps.mut.Unlock()
+
+	for _, topic := range sub.topics {
+		subs := ps.topicSubs[topic]
+		subs = append(subs, sub)
+		ps.topicSubs[topic] = subs
+	}
+
+	return ch, func() {
+		ps.mut.Lock()
+		defer ps.mut.Unlock()
+
+		for _, topic := range sub.topics {
+			subs := ps.topicSubs[topic]
+			subs = slices.DeleteFunc(subs, func(s subscription) bool {
+				return s.ch == sub.ch
 			})
-			topicSubs[topic] = subs
+			ps.topicSubs[topic] = subs
 		}
-	}
-
-	mut.Lock()
-	defer mut.Unlock()
-
-	for _, topic := range topics {
-		subs := topicSubs[topic]
-		subs = append(subs, ch)
-		topicSubs[topic] = subs
-	}
-
-	return ch, unsub, nil
+	}, nil
 }
 
-func loadMessagesForTopics(ctx context.Context, topics []string, timestamp int64) ([]Message, int64, error) {
-	newTopics := make([]string, len(topics))
-	for i, topic := range topics {
-		newTopics[i] = "'" + topic + "'"
-	}
-	topicsSql := strings.Join(newTopics, ", ")
+func (ps *PubSub) Wait() {
+	<-ps.batchCtx.Done()
+}
 
-	query := fmt.Sprintf("SELECT topic, message, timestamp FROM pubsub WHERE topic IN (%s) AND timestamp > %d", topicsSql, timestamp)
-	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, 0, fmt.Errorf("loadMessagesForTopics(%s): %v", topicsSql, err)
-	}
-	defer rows.Close()
+func (ps *PubSub) runBatcher(appCtx context.Context, batchCtx context.Context, cancel context.CancelFunc) {
+	publishQueue := make([][]any, 0, MaxQueueLen)
 
-	var messages []Message
-	var lastTimestamp int64
+	flushTicker := time.Tick(Interval)
+	defer cancel()
 
-	for rows.Next() {
-		var topic, message string
-		var timestampUnix int64
-
-		if err := rows.Scan(&topic, &message, &timestampUnix); err != nil {
-			return nil, 0, fmt.Errorf("loadMessagesForTopics(%s): %v", topicsSql, err)
+	flush := func() {
+		if err := ps.publishMessages(batchCtx, publishQueue); err != nil {
+			logger.Println(err)
 		}
 
-		messages = append(messages, Message{topic, message, time.UnixMilli(timestampUnix)})
-		lastTimestamp = timestampUnix
+		publishQueue = make([][]any, 0, MaxQueueLen)
 	}
 
-	return messages, lastTimestamp, nil
+	for {
+		select {
+		case <-appCtx.Done():
+			go func() {
+				ps.batchChan <- nil
+			}()
+		case msg := <-ps.batchChan:
+			if msg == nil {
+				flush()
+				return
+			}
+
+			publishQueue = append(publishQueue, msg)
+
+			if len(publishQueue) >= MaxQueueLen {
+				flush()
+			}
+		case <-flushTicker:
+			flush()
+		}
+	}
+}
+
+func (ps *PubSub) publishMessages(ctx context.Context, msgs [][]any) error {
+	mCount := len(msgs)
+	if mCount == 0 {
+		return nil
+	}
+
+	fail := func(err error) error {
+		err = fmt.Errorf("publishMessages: failed: %v", err)
+		return err
+	}
+
+	tx, err := ps.rwdb.Write().BeginTx(ctx, nil)
+	if err != nil {
+		return fail(err)
+	}
+	defer tx.Rollback()
+
+	var queryBuilder strings.Builder
+	count := len(msgs)
+	vars := make([]any, 0, 3*mCount)
+
+	queryBuilder.WriteString("INSERT INTO pubsub (topic, message, timestamp) VALUES ")
+
+	for i, publishMsg := range msgs {
+		vars = append(vars, publishMsg...)
+
+		queryBuilder.WriteString("(?, ?, ?)")
+		if i < count-1 {
+			queryBuilder.WriteString(", ")
+		}
+	}
+
+	query := queryBuilder.String()
+	_, err = tx.ExecContext(ctx, query, vars...)
+	if err != nil {
+		return fail(err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fail(err)
+	}
+
+	return nil
+}
+
+func (ps *PubSub) runListener(ctx context.Context, lastId int64) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			rows, err := loadMessagesForTopics(ctx, ps.rwdb.Read(), ps.getTopics(), lastId)
+			if err != nil {
+				if err != context.Canceled {
+					logger.Println(err)
+				}
+
+				return
+			}
+
+			var nRows int
+			for rows.Next() {
+				var topic, message string
+				var id, timestampUnix int64
+
+				if err := rows.Scan(&id, &topic, &message, &timestampUnix); err != nil {
+					if err != context.Canceled {
+						logger.Println(err)
+					}
+
+					rows.Close()
+					return
+				}
+
+				ps.notify(topic, message, timestampUnix)
+
+				lastId = id
+				nRows += 1
+			}
+
+			rows.Close()
+			time.Sleep(Interval)
+		}
+	}
+}
+
+func (ps *PubSub) getTopics() []string {
+	ps.mut.Lock()
+	defer ps.mut.Unlock()
+
+	var topics []string
+	for topic := range ps.topicSubs {
+		topics = append(topics, topic)
+	}
+
+	return topics
+}
+
+func (ps *PubSub) notify(topic, message string, timestampUnix int64) {
+	ps.mut.Lock()
+	defer ps.mut.Unlock()
+
+	subs := ps.topicSubs[topic]
+	msg := &Message{topic, message, time.UnixMicro(timestampUnix)}
+
+	for _, sub := range subs {
+		// Ensure a slow receiver cannot block us
+		go func() {
+			sub.ch <- msg
+		}()
+	}
+}
+
+func loadMessagesForTopics(ctx context.Context, db *sql.DB, topics []string, id int64) (*sql.Rows, error) {
+	fail := func(err error) (*sql.Rows, error) {
+		if err == context.Canceled {
+			return nil, err
+		}
+
+		return nil, fmt.Errorf("loadMessagesForTopics(%s): %v", strings.Join(topics, ", "), err)
+	}
+
+	var vars []any
+	vars = append(vars, id)
+
+	var queryBuilder strings.Builder
+	queryBuilder.WriteString("SELECT id, topic, message, timestamp FROM pubsub WHERE id > ? AND topic IN (")
+
+	nTopics := len(topics)
+	for i, topic := range topics {
+		queryBuilder.WriteString("?")
+		if i < nTopics-1 {
+			queryBuilder.WriteString(", ")
+		}
+
+		vars = append(vars, topic)
+	}
+
+	queryBuilder.WriteString(") ORDER BY timestamp")
+	query := queryBuilder.String()
+
+	// fmt.Println(query, vars)
+	rows, err := db.QueryContext(ctx, query, vars...)
+	if err != nil {
+		return fail(err)
+	}
+
+	return rows, nil
 }

@@ -2,16 +2,17 @@ package cli
 
 import (
 	"context"
-	"database/sql"
 	"flag"
 	"fmt"
 	"os"
 
 	"github.com/tehlordvortex/updawg/config"
+	"github.com/tehlordvortex/updawg/database"
 	"github.com/tehlordvortex/updawg/models"
+	"github.com/tehlordvortex/updawg/pubsub"
 )
 
-func runTargetsCommand(ctx context.Context, db *sql.DB, args []string) {
+func runTargetsCommand(ctx context.Context, rwdb *database.RWDB, ps *pubsub.PubSub, args []string) {
 	fs := flag.NewFlagSet("targets", flag.ExitOnError)
 	if err := fs.Parse(args); err != nil {
 		logger.Fatalln(err)
@@ -29,13 +30,13 @@ func runTargetsCommand(ctx context.Context, db *sql.DB, args []string) {
 
 	switch command {
 	case "create":
-		runCreateCommand(ctx, db, subArgs)
+		runCreateCommand(ctx, rwdb, ps, subArgs)
 	case "modify":
-		runModifyCommand(ctx, db, subArgs)
+		runModifyCommand(ctx, rwdb, ps, subArgs)
 	case "list":
-		runListCommand(ctx, db, subArgs)
+		runListCommand(ctx, rwdb, ps, subArgs)
 	case "delete":
-		runDeleteCommand(ctx, db, subArgs)
+		runDeleteCommand(ctx, rwdb, ps, subArgs)
 	default:
 		logger.Println("unknown command:", command)
 		printTargetsUsage(fs)
@@ -54,7 +55,7 @@ func printTargetsUsage(fs *flag.FlagSet) {
 	flag.PrintDefaults()
 }
 
-func runCreateCommand(ctx context.Context, db *sql.DB, args []string) {
+func runCreateCommand(ctx context.Context, rwdb *database.RWDB, ps *pubsub.PubSub, args []string) {
 	fs := flag.NewFlagSet("targets create", flag.ExitOnError)
 	name := fs.String("name", "", "An optional name for the target")
 	uri := fs.String("uri", "", "The URI to make requests to")
@@ -77,14 +78,15 @@ func runCreateCommand(ctx context.Context, db *sql.DB, args []string) {
 		Period: int64(*period),
 	}
 
-	if err := target.Save(ctx, db); err != nil {
+	if err := target.Save(ctx, rwdb.Write()); err != nil {
 		logger.Fatalln(err)
 	}
 
+	ps.PublishAsync(models.TargetCreatedTopic, target.Id())
 	logger.Println("target created id=" + target.Id())
 }
 
-func runModifyCommand(ctx context.Context, db *sql.DB, args []string) {
+func runModifyCommand(ctx context.Context, rwdb *database.RWDB, ps *pubsub.PubSub, args []string) {
 	fs := flag.NewFlagSet("targets modify", flag.ExitOnError)
 	id := fs.String("id", "", "The ID of the target to modify (can be partial)")
 	name := fs.String("name", "", "An optional name for the target")
@@ -101,7 +103,7 @@ func runModifyCommand(ctx context.Context, db *sql.DB, args []string) {
 		os.Exit(1)
 	}
 
-	targets, err := models.FindTargetsByIdPrefix(ctx, db, *id)
+	targets, err := models.FindTargetsByIdPrefix(ctx, rwdb.Read(), *id)
 	if err != nil {
 		logger.Fatalln(err)
 	}
@@ -130,15 +132,16 @@ func runModifyCommand(ctx context.Context, db *sql.DB, args []string) {
 		target.Period = int64(*period)
 	}
 
-	if err := target.Save(ctx, db); err != nil {
+	if err := target.Save(ctx, rwdb.Write()); err != nil {
 		logger.Fatalln(err)
 	}
 
+	ps.PublishAsync(models.TargetUpdatedTopic, target.Id())
 	logger.Println("target updated:", target)
 }
 
-func runListCommand(ctx context.Context, db *sql.DB, args []string) {
-	targets, err := models.FindAllTargets(ctx, db)
+func runListCommand(ctx context.Context, rwdb *database.RWDB, ps *pubsub.PubSub, args []string) {
+	targets, err := models.FindAllTargets(ctx, rwdb.Read())
 	if err != nil {
 		logger.Fatalln(err)
 	}
@@ -148,14 +151,14 @@ func runListCommand(ctx context.Context, db *sql.DB, args []string) {
 	}
 }
 
-func runDeleteCommand(ctx context.Context, db *sql.DB, args []string) {
+func runDeleteCommand(ctx context.Context, rwdb *database.RWDB, ps *pubsub.PubSub, args []string) {
 	if len(args) == 0 {
 		logger.Fatalln("missing target id")
 	}
 
 	id := args[0]
 
-	targets, err := models.FindTargetsByIdPrefix(ctx, db, id)
+	targets, err := models.FindTargetsByIdPrefix(ctx, rwdb.Read(), id)
 	if err != nil {
 		logger.Fatalln(err)
 	}
@@ -167,9 +170,10 @@ func runDeleteCommand(ctx context.Context, db *sql.DB, args []string) {
 	}
 
 	target := targets[0]
-	if err := target.Delete(ctx, db); err != nil {
+	if err := target.Delete(ctx, rwdb.Write()); err != nil {
 		logger.Fatalln(err)
 	}
 
+	ps.PublishAsync(models.TargetDeletedTopic, target.Id())
 	logger.Println("deleted:", target)
 }

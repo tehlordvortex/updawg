@@ -18,12 +18,43 @@ type (
 
 var (
 	ErrRecordNotPersisted = fmt.Errorf("record has not been saved to the database")
-	ErrRecordDeleted      = fmt.Errorf("record has been deleted")
+	ErrRecordDeleted      = sql.ErrNoRows
 )
 
 type PassiveRecord interface {
-	Load(PassiveRecordScanFunc)
+	Load(PassiveRecordScanFunc) error
 	Reload(context.Context, QueryExecutor) error
 	Save(context.Context, QueryExecutor) error
 	Delete(context.Context, QueryExecutor) error
+}
+
+func LoadRecord[R PassiveRecord](row *sql.Row) (R, error) {
+	var r R
+
+	if err := r.Load(func(cols []interface{}) error {
+		return row.Scan(cols...)
+	}); err != nil {
+		return r, err
+	}
+
+	return r, nil
+}
+
+func LoadRecords[R PassiveRecord](rows *sql.Rows) ([]R, error) {
+	var dest []R
+
+	for rows.Next() {
+		var t R
+
+		err := t.Load(func(cols []interface{}) error {
+			return rows.Scan(cols...)
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		dest = append(dest, t)
+	}
+
+	return dest, nil
 }

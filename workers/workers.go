@@ -2,14 +2,15 @@ package workers
 
 import (
 	"context"
-	"database/sql"
 	"log"
 
 	"github.com/tehlordvortex/updawg/config"
+	"github.com/tehlordvortex/updawg/database"
+	"github.com/tehlordvortex/updawg/pubsub"
 )
 
-var logger = log.New(config.GetLogFile(), "", log.Default().Flags()|log.Lmsgprefix|log.Llongfile)
+var logger = log.New(config.GetLogFile(), "", log.Default().Flags()|log.Lmsgprefix|log.Lshortfile)
 
-func Run(ctx context.Context, db *sql.DB) {
-	go runTargetsWorker(ctx, db)
+func Run(ctx context.Context, rwdb *database.RWDB, ps *pubsub.PubSub) {
+	go runTargetsWorker(ctx, rwdb, ps)
 }

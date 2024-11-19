@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/tehlordvortex/updawg/config"
-	"github.com/tehlordvortex/updawg/pubsub"
 )
 
 const (
@@ -97,7 +96,6 @@ func (t *Target) Save(ctx context.Context, qe QueryExecutor) error {
 		t.createdAt = time.Unix(unix, 0)
 		t.updatedAt = time.Unix(unix, 0)
 
-		_ = pubsub.Publish(ctx, TargetCreatedTopic, t.id)
 		return nil
 	}
 
@@ -108,7 +106,6 @@ func (t *Target) Save(ctx context.Context, qe QueryExecutor) error {
 
 	t.updatedAt = time.Unix(unix, 0)
 
-	_ = pubsub.Publish(ctx, TargetUpdatedTopic, t.id)
 	return nil
 }
 
@@ -124,68 +121,36 @@ func (t *Target) Delete(ctx context.Context, qe QueryExecutor) error {
 
 	t.pk = -1
 
-	_ = pubsub.Publish(ctx, TargetDeletedTopic, t.id)
 	return nil
 }
 
-func FindAllTargets(ctx context.Context, qe QueryExecutor) ([]Target, error) {
+func FindAllTargets(ctx context.Context, qe QueryExecutor) ([]*Target, error) {
 	rows, err := qe.QueryContext(ctx, "SELECT * FROM targets")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	return LoadTargets(rows)
+	return LoadRecords[*Target](rows)
 }
 
-func FindAllActiveTargets(ctx context.Context, qe QueryExecutor) ([]Target, error) {
+func FindAllActiveTargets(ctx context.Context, qe QueryExecutor) ([]*Target, error) {
 	// TODO: Disable/enable targets
 	return FindAllTargets(ctx, qe)
 }
 
-func FindTargetById(ctx context.Context, qe QueryExecutor, id string) (Target, error) {
-	return LoadTarget(qe.QueryRowContext(ctx, "SELECT * FROM targets WHERE id = ?", id))
+func FindTargetById(ctx context.Context, qe QueryExecutor, id string) (*Target, error) {
+	return LoadRecord[*Target](qe.QueryRowContext(ctx, "SELECT * FROM targets WHERE id = ?", id))
 }
 
-func FindTargetsByIdPrefix(ctx context.Context, qe QueryExecutor, prefix string) ([]Target, error) {
+func FindTargetsByIdPrefix(ctx context.Context, qe QueryExecutor, prefix string) ([]*Target, error) {
 	rows, err := qe.QueryContext(ctx, "SELECT * FROM targets WHERE id LIKE ?", prefix+"%")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	return LoadTargets(rows)
-}
-
-func LoadTarget(row *sql.Row) (Target, error) {
-	var t Target
-
-	if err := t.Load(func(cols []interface{}) error {
-		return row.Scan(cols...)
-	}); err != nil {
-		return Target{}, fmt.Errorf("LoadTarget: %v", err)
-	}
-
-	return t, nil
-}
-
-func LoadTargets(rows *sql.Rows) ([]Target, error) {
-	var targets []Target
-
-	for rows.Next() {
-		var t Target
-
-		err := t.Load(func(cols []interface{}) error {
-			return rows.Scan(cols...)
-		})
-		if err != nil {
-			return nil, fmt.Errorf("LoadTargets: %v", err)
-		}
-
-		targets = append(targets, t)
-	}
-
-	return targets, nil
+	return LoadRecords[*Target](rows)
 }
 
 func loadTarget(t *Target, Scan PassiveRecordScanFunc) error {
